@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from database import db, create_document, get_documents
-from schemas import Transaction, Budget, Profile
+from schemas import Transaction, Budget, Profile, DEFAULT_CATEGORIES
 
 app = FastAPI(title="Personal Finance Tracker API")
 
@@ -75,6 +75,66 @@ def bootstrap_sample_data(_: SampleBootstrap):
 
     return {"status": "ok"}
 
+# ---------------- Profile & Onboarding -----------------
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    currency: Optional[str] = None
+    dark_mode: Optional[bool] = None
+    categories: Optional[List[str]] = None
+    onboarded: Optional[bool] = None
+
+class OnboardingPayload(BaseModel):
+    currency: str
+    target: float
+    categories: Optional[List[str]] = None
+
+@app.get("/profile")
+def get_profile():
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    prof = db["profile"].find_one({})
+    if not prof:
+        # create default profile
+        create_document("profile", Profile())
+        prof = db["profile"].find_one({})
+    prof["id"] = str(prof.pop("_id")) if prof.get("_id") else None
+    # ensure categories
+    if not prof.get("categories"):
+        prof["categories"] = DEFAULT_CATEGORIES
+    return prof
+
+@app.post("/profile")
+def update_profile(payload: ProfileUpdate):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    update = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
+    if not update:
+        return {"status": "noop"}
+    db["profile"].update_one({}, {"$set": update}, upsert=True)
+    return {"status": "ok"}
+
+@app.post("/onboarding")
+def complete_onboarding(payload: OnboardingPayload):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    # Update profile
+    update = {
+        "currency": payload.currency,
+        "onboarded": True,
+    }
+    if payload.categories:
+        update["categories"] = payload.categories
+    db["profile"].update_one({}, {"$set": update}, upsert=True)
+    # Set budget (monthly target)
+    now = datetime.utcnow()
+    month_key = f"{now.year:04d}-{now.month:02d}"
+    db["budget"].update_one(
+        {"month": month_key},
+        {"$set": {"month": month_key, "amount": float(payload.target), "updated_at": datetime.utcnow()}},
+        upsert=True,
+    )
+    return {"status": "ok"}
+
 # ---------------- Finance Endpoints -----------------
 @app.get("/summary")
 def get_summary(month: Optional[str] = Query(None, description="YYYY-MM")):
@@ -108,6 +168,9 @@ def get_summary(month: Optional[str] = Query(None, description="YYYY-MM")):
     budget_amount = bud_doc.get("amount", 0) if bud_doc else 0
     progress = month_spend / budget_amount if budget_amount else 0
 
+    prof = db["profile"].find_one({}) or {}
+    currency = prof.get("currency", "$")
+
     recent = list(db["transaction"].find().sort("date", -1).limit(10))
     # Convert ObjectId to str and datetime to isoformat
     def serialize(doc):
@@ -124,6 +187,7 @@ def get_summary(month: Optional[str] = Query(None, description="YYYY-MM")):
         "month_spend": round(month_spend, 2),
         "budget": budget_amount,
         "progress": progress,
+        "currency": currency,
         "recent": [serialize(r) for r in recent],
     }
 
@@ -213,7 +277,11 @@ def set_budget(payload: BudgetSet):
 
 @app.get("/categories")
 def categories():
-    return ["Food", "Bills", "Transport", "Shopping", "Savings", "Other"]
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    prof = db["profile"].find_one({}) or {}
+    cats = prof.get("categories") or DEFAULT_CATEGORIES
+    return cats
 
 if __name__ == "__main__":
     import uvicorn
